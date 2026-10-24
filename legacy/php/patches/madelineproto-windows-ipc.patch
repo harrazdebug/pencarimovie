@@ -1,0 +1,487 @@
+diff --git a/src/DoHWrapper.php b/src/DoHWrapper.php
+index 7323940..09b6500 100644
+--- a/src/DoHWrapper.php
++++ b/src/DoHWrapper.php
+@@ -91,15 +91,29 @@ final class DoHWrapper
+             #[\Override]
+             public function loadConfig(): DnsConfig
+             {
+-                $loader = stripos(PHP_OS, 'win') === 0 ? new WindowsDnsConfigLoader() : new UnixDnsConfigLoader();
++                if (stripos(PHP_OS, 'win') === 0) {
++                    $loader = new WindowsDnsConfigLoader();
++                } else {
++                    $prefix = $_SERVER['PREFIX'] ?? ($_ENV['PREFIX'] ?? '');
++                    $termuxResolv = $prefix !== '' ? ($prefix . '/etc/resolv.conf') : '';
++                    if ($termuxResolv !== '' && is_file($termuxResolv)) {
++                        $loader = new UnixDnsConfigLoader($termuxResolv);
++                    } elseif (is_file('/data/data/com.pencarimovie.downloader/files/usr/etc/resolv.conf')) {
++                        $loader = new UnixDnsConfigLoader('/data/data/com.pencarimovie.downloader/files/usr/etc/resolv.conf');
++                    } elseif (is_file('/data/data/com.termux/files/usr/etc/resolv.conf')) {
++                        $loader = new UnixDnsConfigLoader('/data/data/com.termux/files/usr/etc/resolv.conf');
++                    } else {
++                        $loader = new UnixDnsConfigLoader();
++                    }
++                }
+                 try {
+                     return $loader->loadConfig();
+                 } catch (Throwable) {
+                     return new DnsConfig([
+-                        '1.1.1.1',
+-                        '1.0.0.1',
+-                        '[2606:4700:4700::1111]',
+-                        '[2606:4700:4700::1001]',
++                        '1.1.1.1:53',
++                        '1.0.0.1:53',
++                        '[2606:4700:4700::1111]:53',
++                        '[2606:4700:4700::1001]:53',
+                     ]);
+                 }
+             }
+@@ -154,7 +168,7 @@ final class DoHWrapper
+                             $first[] = [$proxy, $extra];
+                             $combo = array_merge($first, $second);
+                         }
+-                        $proxyCombos []= $combo;
++                        $proxyCombos[] = $combo;
+                     }
+                 }
+             }
+diff --git a/src/Exception.php b/src/Exception.php
+index e4271ec..5c49236 100644
+--- a/src/Exception.php
++++ b/src/Exception.php
+@@ -85,12 +85,15 @@ class Exception extends \Exception
+         $errfileReplaced = $errfile ?? '';
+         // If error is suppressed with @, don't throw an exception
+         if (error_reporting() === 0
++            || !(error_reporting() & $errno)
+             || strpos($errstr, 'headers already sent')
+             || str_contains($errstr, 'Creation of dynamic property')
+             || str_contains($errstr, 'Legacy nullable type detected')
+             || str_contains($errstr, '$tdMethods is deprecated')
++            || str_contains($errstr, 'The operation completed successfully')
+             || $errfileReplaced && (
+                 str_contains($errfileReplaced, DIRECTORY_SEPARATOR.'amphp'.DIRECTORY_SEPARATOR)
++                || str_contains($errfileReplaced, DIRECTORY_SEPARATOR.'danog'.DIRECTORY_SEPARATOR.'ipc')
+                 || str_contains($errfileReplaced, DIRECTORY_SEPARATOR.'league'.DIRECTORY_SEPARATOR)
+                 || str_contains($errfileReplaced, DIRECTORY_SEPARATOR.'phpseclib'.DIRECTORY_SEPARATOR)
+                 || str_contains($errfileReplaced, DIRECTORY_SEPARATOR.'symfony'.DIRECTORY_SEPARATOR)
+diff --git a/src/Ipc/Runner/ProcessRunner.php b/src/Ipc/Runner/ProcessRunner.php
+index fd59432..62a77ec 100644
+--- a/src/Ipc/Runner/ProcessRunner.php
++++ b/src/Ipc/Runner/ProcessRunner.php
+@@ -1,4 +1,6 @@
+-<?php declare(strict_types=1);
++<?php
++
++declare(strict_types=1);
+ 
+ /**
+  * This file is part of MadelineProto.
+@@ -113,7 +115,62 @@ final class ProcessRunner extends RunnerAbstract
+             }
+         }
+         $envVars = array_merge(
+-            array_filter($_SERVER, static fn ($v, $k): bool => \is_string($v) && !\in_array($k, self::CGI_VARS, true), ARRAY_FILTER_USE_BOTH),
++            // On Windows, build a minimal allow-list to avoid proc_open "Command conversion failed".
++            // On Linux / Android Termux, preserve standard environment variables (PREFIX, LD_LIBRARY_PATH, HOME, etc.)
++            // so native CLI PHP and its dynamic libraries link and execute properly.
++            (static function (): array {
++                $envVars = [];
++                $isWindows = strncasecmp(PHP_OS, 'WIN', 3) === 0;
++                $allowed = $isWindows ? [
++                    'PATH',
++                    'SystemRoot',
++                    'TEMP',
++                    'TMP',
++                    'ComSpec',
++                    'PATHEXT',
++                    'HOMEDRIVE',
++                    'HOMEPATH',
++                    'USERPROFILE',
++                    'SystemDrive',
++                    'ProgramFiles',
++                    'ProgramFiles(x86)',
++                    'ProgramW6432',
++                    'APPDATA',
++                    'LOCALAPPDATA',
++                    'NUMBER_OF_PROCESSORS',
++                    'PROCESSOR_ARCHITECTURE',
++                    'OS',
++                    'COMPUTERNAME',
++                    'USERNAME',
++                    'windir'
++                ] : [
++                    'PATH',
++                    'PREFIX',
++                    'LD_LIBRARY_PATH',
++                    'HOME',
++                    'TMPDIR',
++                    'TEMP',
++                    'TMP',
++                    'USER',
++                    'SHELL',
++                    'LANG',
++                    'LC_ALL',
++                    'PHP_INI_SCAN_DIR',
++                    'PHPRC',
++                    'TERM',
++                    'ANDROID_DATA',
++                    'ANDROID_ROOT'
++                ];
++
++                foreach ($allowed as $envName) {
++                    if (isset($_SERVER[$envName]) && \is_string($_SERVER[$envName])) {
++                        $envVars[$envName] = $_SERVER[$envName];
++                    } elseif (isset($_ENV[$envName]) && \is_string($_ENV[$envName])) {
++                        $envVars[$envName] = $_ENV[$envName];
++                    }
++                }
++                return $envVars;
++            })(),
+             [
+                 'QUERY_STRING' => http_build_query($params),
+                 'absoluteRootDir' => $root,
+@@ -121,7 +178,13 @@ final class ProcessRunner extends RunnerAbstract
+             ],
+         );
+ 
+-        self::$resources []= proc_open(
++        // On Windows, use bypass_shell and pass clean environment or null if proc_open conversion fails
++        $options = [];
++        if (strncasecmp(PHP_OS, 'WIN', 3) === 0) {
++            $options['bypass_shell'] = true;
++        }
++
++        $res = @proc_open(
+             $command,
+             [
+                 ["pipe", "r"],
+@@ -130,8 +193,26 @@ final class ProcessRunner extends RunnerAbstract
+             ],
+             $pipes,
+             null,
+-            $envVars
++            $envVars,
++            $options
+         );
++
++        if (!\is_resource($res)) {
++            // Fallback attempt without envVars if Windows command conversion failed due to env
++            $res = proc_open(
++                $command,
++                [
++                    ["pipe", "r"],
++                    ["pipe", "w"],
++                    ["pipe", "w"],
++                ],
++                $pipes,
++                null,
++                null
++            );
++        }
++
++        self::$resources[] = $res;
+         $stdout = new ReadableResourceStream($pipes[1]);
+         $stderr = new ReadableResourceStream($pipes[2]);
+ 
+@@ -165,13 +246,37 @@ final class ProcessRunner extends RunnerAbstract
+     {
+         $executable = strncasecmp(PHP_OS, 'WIN', 3) === 0 ? 'php.exe' : 'php';
+ 
+-        $paths = array_filter(explode(PATH_SEPARATOR, getenv('PATH') ?: ''));
++        // 1. Check known Termux / custom Android prefix first
++        $prefix = $_SERVER['PREFIX'] ?? ($_ENV['PREFIX'] ?? '');
++        if ($prefix !== '' && is_file($prefix . '/bin/' . $executable) && is_executable($prefix . '/bin/' . $executable)) {
++            return self::$binaryPath = $prefix . '/bin/' . $executable;
++        }
++
++        $candidates = [
++            '/data/data/com.pencarimovie.downloader/files/usr/bin/' . $executable,
++            '/data/data/com.termux/files/usr/bin/' . $executable,
++        ];
++        foreach ($candidates as $cand) {
++            if (is_file($cand) && is_executable($cand)) {
++                return self::$binaryPath = $cand;
++            }
++        }
++
++        // 2. Check bundled bin/php wrapper or binary
++        $bundled = realpath(__DIR__ . '/../../../../../../bin/' . $executable);
++        if ($bundled && file_exists($bundled)) {
++            return self::$binaryPath = $bundled;
++        }
++
++        // 3. Fall back to PATH scan
++        $envPath = $_SERVER['PATH'] ?? ($_ENV['PATH'] ?? getenv('PATH') ?: '');
++        $paths = array_filter(explode(PATH_SEPARATOR, $envPath));
+         $paths[] = PHP_BINDIR;
+         $paths = array_unique($paths);
+ 
+         foreach ($paths as $path) {
+-            $path .= DIRECTORY_SEPARATOR.$executable;
+-            if (is_executable($path)) {
++            $path .= DIRECTORY_SEPARATOR . $executable;
++            if (is_file($path) && is_executable($path)) {
+                 return self::$binaryPath = $path;
+             }
+         }
+diff --git a/src/Ipc/Runner/WebRunner.php b/src/Ipc/Runner/WebRunner.php
+index c2ce84e..3f37dfe 100644
+--- a/src/Ipc/Runner/WebRunner.php
++++ b/src/Ipc/Runner/WebRunner.php
+@@ -48,36 +48,10 @@ final class WebRunner extends RunnerAbstract
+     #[\Override]
+     public static function start(string $session, int $startupId): bool
+     {
+-        if (!isset($_SERVER['SERVER_NAME']) || !$_SERVER['SERVER_NAME']) {
+-            return false;
+-        }
+-
+-        if (!self::$runPath) {
+-            $absoluteRootDir = self::getAbsoluteRootDir();
+-            $runPath = self::getScriptPath($absoluteRootDir);
+-
+-            if (substr($runPath, 0, \strlen($absoluteRootDir)) === $absoluteRootDir) { // Process runner is within readable document root
+-                self::$runPath = substr($runPath, \strlen($absoluteRootDir)-1);
+-            } else {
+-                throw new AssertionError("$runPath is not within absolute document root $absoluteRootDir!");
+-            }
+-
+-            self::$runPath = str_replace(DIRECTORY_SEPARATOR, '/', self::$runPath);
+-            self::$runPath = str_replace('//', '/', self::$runPath);
+-        }
+-
+-        $params = [
+-            'argv' => ['madeline-ipc', $session, $startupId],
+-            'cwd' => Magic::getcwd(),
+-            'MadelineSelfRestart' => 1,
+-        ];
+-        if (\function_exists('memprof_enabled') && memprof_enabled()) {
+-            $params['MEMPROF_PROFILE'] = '1';
+-        }
+-
+-        self::selfStart(self::$runPath.'?'.http_build_query($params));
+-
+-        return true;
++        // WebRunner attempts HTTP loopback self-calls which fail under custom routers,
++        // rewrite rules (/api/*), FrankenPHP, and mobile environments (0.0.0.0 bind / TLS timeouts).
++        // Return false so MadelineProto exclusively relies on CLI ProcessRunner / fd_ensure_ipc_worker().
++        return false;
+     }
+ 
+     private static ?string $absoluteRootDir = null;
+diff --git a/src/Logger.php b/src/Logger.php
+index d69cbf5..89b63ea 100644
+--- a/src/Logger.php
++++ b/src/Logger.php
+@@ -371,7 +371,11 @@ final class Logger
+     {
+         foreach (self::$closePromises as [$stdout, $promise]) {
+             $stdout->close();
+-            $promise->await();
++            try {
++                $promise->await();
++            } catch (\Throwable) {
++                // Ignore driver suspension / cancellation errors on shutdown
++            }
+         }
+     }
+     /**
+diff --git a/src/MTProtoSession/MsgIdHandler.php b/src/MTProtoSession/MsgIdHandler.php
+index f28352f..855f5b7 100644
+--- a/src/MTProtoSession/MsgIdHandler.php
++++ b/src/MTProtoSession/MsgIdHandler.php
+@@ -65,17 +65,22 @@ final class MsgIdHandler
+     {
+         $minMessageId = (time() + $this->session->time_delta - 300) << 32;
+         if ($newMessageId < $minMessageId) {
+-            $this->session->API->logger->logger('Given message id ('.$newMessageId.') is too old compared to the min value ('.$minMessageId.').', Logger::WARNING);
++            $this->session->API->logger->logger('Given message id (' . $newMessageId . ') is too old compared to the min value (' . $minMessageId . ').', Logger::WARNING);
+         }
+         $maxMessageId = (time() + $this->session->time_delta + 30) << 32;
+         if ($newMessageId > $maxMessageId) {
+-            throw new Exception('Given message id ('.$newMessageId.') is too new compared to the max value ('.$maxMessageId.'). Please sync your date using NTP.');
++            // Clock skew auto-correction: dynamically adjust time_delta rather than throwing fatal exception
++            $skewSec = ($newMessageId >> 32) - time();
++            $this->session->time_delta = max(-300, min(300, $skewSec));
++            if (isset($this->session->API->logger)) {
++                $this->session->API->logger->logger('Auto-adjusting session time_delta to ' . $this->session->time_delta . ' due to clock skew.', Logger::WARNING);
++            }
+         }
+         if ($newMessageId % 4) {
+-            throw new Exception('Given message id ('.$newMessageId.') is not divisible by 4. Please sync your date using NTP.');
++            throw new Exception('Given message id (' . $newMessageId . ') is not divisible by 4. Please sync your date using NTP.');
+         }
+         if ($newMessageId <= $this->maxOutgoingId) {
+-            throw new Exception('Given message id ('.$newMessageId.') is lower than or equal to the current limit ('.$this->maxOutgoingId.'). Please sync your date using NTP.');
++            throw new Exception('Given message id (' . $newMessageId . ') is lower than or equal to the current limit (' . $this->maxOutgoingId . '). Please sync your date using NTP.');
+         }
+         $this->maxOutgoingId = $newMessageId;
+     }
+@@ -86,11 +91,16 @@ final class MsgIdHandler
+     {
+         $minMessageId = (time() + $this->session->time_delta - 300) << 32;
+         if ($newMessageId < $minMessageId) {
+-            $this->session->API->logger->logger('Given message id ('.$newMessageId.') is too old compared to the min value ('.$minMessageId.').', Logger::WARNING);
++            $this->session->API->logger->logger('Given message id (' . $newMessageId . ') is too old compared to the min value (' . $minMessageId . ').', Logger::WARNING);
+         }
+         $maxMessageId = (time() + $this->session->time_delta + 30) << 32;
+         if ($newMessageId > $maxMessageId) {
+-            throw new Exception('Given message id ('.$newMessageId.') is too new compared to the max value ('.$maxMessageId.'). Please sync your date using NTP.');
++            // Clock skew auto-correction: dynamically adjust time_delta rather than throwing fatal exception
++            $skewSec = ($newMessageId >> 32) - time();
++            $this->session->time_delta = max(-300, min(300, $skewSec));
++            if (isset($this->session->API->logger)) {
++                $this->session->API->logger->logger('Auto-adjusting session time_delta to ' . $this->session->time_delta . ' due to clock skew.', Logger::WARNING);
++            }
+         }
+         if (!($newMessageId % 2)) {
+             throw new Exception('message id mod 4 != 1 or 3');
+@@ -98,11 +108,11 @@ final class MsgIdHandler
+         $key = $this->maxIncomingId;
+         if ($container) {
+             if ($newMessageId >= $key) {
+-                $this->session->API->logger->logger('Given message id ('.$newMessageId.') is bigger than or equal to the current limit ('.$key.'). Please sync your date using NTP.', Logger::ULTRA_VERBOSE);
++                $this->session->API->logger->logger('Given message id (' . $newMessageId . ') is bigger than or equal to the current limit (' . $key . '). Please sync your date using NTP.', Logger::ULTRA_VERBOSE);
+             }
+         } else {
+             if ($newMessageId <= $key) {
+-                $this->session->API->logger->logger('Given message id ('.$newMessageId.') is lower than or equal to the current limit ('.$key.'). Please sync your date using NTP.', Logger::ULTRA_VERBOSE);
++                $this->session->API->logger->logger('Given message id (' . $newMessageId . ') is lower than or equal to the current limit (' . $key . '). Please sync your date using NTP.', Logger::ULTRA_VERBOSE);
+             }
+         }
+         $this->maxIncomingId = $newMessageId;
+@@ -138,7 +148,7 @@ final class MsgIdHandler
+     {
+         $usage = memory_get_usage();
+         $this->session->cleanupSession();
+-        $cleaned = round(($usage - memory_get_usage())/1024/1024, 1);
++        $cleaned = round(($usage - memory_get_usage()) / 1024 / 1024, 1);
+         if ($cleaned && !Magic::$suspendPeriodicLogging) {
+             $this->session->API->logger->logger("Zend hashmap reallocation done. Cleaned memory: $cleaned Mb", Logger::VERBOSE);
+         }
+diff --git a/src/MTProtoTools/ReferenceDatabase.php b/src/MTProtoTools/ReferenceDatabase.php
+--- a/src/MTProtoTools/ReferenceDatabase.php
++++ b/src/MTProtoTools/ReferenceDatabase.php
+@@ -500,6 +500,9 @@ final class ReferenceDatabase implements TLCallback
+         $ok = false;
+         foreach ($queue as $locationString => $_) {
+             $data = $this->getDb($locationString);
++            if (!\is_array($data) || !isset($data['reference']) || empty($data['origins'])) {
++                continue;
++            }
+             $data['reference'] = (string) $data['reference'];
+             $count = 0;
+             foreach ($data['origins'] ?? [] as $originType => $origin) {
+diff --git a/src/Settings/Ipc.php b/src/Settings/Ipc.php
+index 0ba694d..27180d9 100644
+--- a/src/Settings/Ipc.php
++++ b/src/Settings/Ipc.php
+@@ -34,6 +34,18 @@ final class Ipc extends SettingsAbstract
+      */
+     public function getSlow(): bool
+     {
+-        return Magic::$isIpcWorker || \PHP_OS_FAMILY === 'Windows';
++        // Force full boot only when executing inside the spawned CLI IPC worker
++        // itself (Magic::$isIpcWorker) or during a fresh bot login before any
++        // session file exists (FD_FORCE_FULL_BOOT).
++        //
++        // Do NOT add `defined('MADELINE_WORKER')` here. MADELINE_WORKER is
++        // defined by entry.php, but under FrankenPHP the PHP process is REUSED
++        // across requests, so the constant leaks into later web requests in the
++        // same worker thread. That made every `new API()` do a full-mode boot
++        // (is_ipc:false) even though an IPC worker was ready, and a full-mode
++        // instance SAVES THE SESSION on shutdown, destroying the live IPC
++        // worker and making concurrent requests fail with
++        // "The endpoint does not exist!" after a 30s tryConnect() retry loop.
++        return Magic::$isIpcWorker || !empty($GLOBALS['FD_FORCE_FULL_BOOT']);
+     }
+ }
+diff --git a/src/Shutdown.php b/src/Shutdown.php
+index 05e2406..a873ea5 100644
+--- a/src/Shutdown.php
++++ b/src/Shutdown.php
+@@ -56,9 +56,15 @@ final class Shutdown
+         if (\defined('STDIN')) {
+             getStdin()->unreference();
+         }
+-        API::finalize();
+-        MTProto::serializeAll();
+-        Logger::finalize();
++        try {
++            API::finalize();
++        } catch (\Throwable) {}
++        try {
++            MTProto::serializeAll();
++        } catch (\Throwable) {}
++        try {
++            Logger::finalize();
++        } catch (\Throwable) {}
+         if (class_exists(Installer::class)) {
+             Installer::unlock();
+         }
+diff --git a/src/Ipc/Runner/entry.php b/src/Ipc/Runner/entry.php
+index e7f2597..3fcfcbb 100644
+--- a/src/Ipc/Runner/entry.php
++++ b/src/Ipc/Runner/entry.php
+@@ -46,6 +46,11 @@
+         $arguments = [];
+         if (isset($GLOBALS['argv']) && !empty($GLOBALS['argv'])) {
+             $arguments = \array_slice($GLOBALS['argv'], 1);
++            // FrankenPHP 1.13.0+ prepends the binary itself (os.Args[0]) to argv, so $argv[0] is frankenphp
++            // and $argv[1] is the script path. If arguments still start with the script path, strip it.
++            if (isset($arguments[0]) && (\str_ends_with($arguments[0], '.php') || (isset($arguments[1]) && \in_array($arguments[1], ['madeline-ipc', 'madeline-worker'], true)))) {
++                \array_shift($arguments);
++            }
+         } elseif (isset($_GET['argv']) && !empty($_GET['argv'])) {
+             $arguments = $_GET['argv'];
+         }
+@@ -115,3 +120,17 @@
+             $API->initSelfRestart();
+             $session->storeIpcState(new IpcState($runnerId));
++
++            // Monitor worker memory usage and periodically run GC to combat glibc fragmentation
++            \Revolt\EventLoop::repeat(30.0, static function () use ($API): void {
++                \gc_collect_cycles();
++                if (\function_exists('gc_mem_caches')) {
++                    \gc_mem_caches();
++                }
++                $maxBytes = (int) (getenv('MADELINE_WORKER_MAX_MEMORY') ?: (512 * 1024 * 1024)); // 512 MiB default
++                if (\memory_get_usage(true) > $maxBytes) {
++                    Logger::log("IPC worker memory limit exceeded (" . \round(\memory_get_usage(true) / 1048576) . " MiB > " . \round($maxBytes / 1048576) . " MiB). Restarting worker to release heap fragmentation.", Logger::FATAL_ERROR);
++                    $API->restart();
++                }
++            });
++
+             while (true) {
+
+diff --git a/src/MTProto.php b/src/MTProto.php
+--- a/src/MTProto.php
++++ b/src/MTProto.php
+@@ -1143,11 +1143,23 @@ final class MTProto implements TLCallback, LoggerGetter, SettingsGetter
+         }
+         $this->updateCtr = $this->getPromCounter("MadelineProto", "update_count", "Number of received updates since the session was created");
+         // Start IPC server
+-        if (!$this->ipcServer) {
++        //
++        // Shared hosting (cPanel/ByetHost: `disable_functions` covers
++        // stream_socket_server, posix_mkfifo, pfsockopen) can never serve an IPC
++        // endpoint, and this instance is used strictly in-process there, so the
++        // endpoint is never dialled. Without this guard `new Server($this)` dies
++        // with "Call to undefined function stream_socket_server()" during
++        // initialize() and MadelineProto cannot boot at all.
++        // No-op on every host that has stream_socket_server (Windows, Linux,
++        // Termux, FrankenPHP). Kept in patches/madelineproto-windows-ipc.patch.
++        $fdCanServeIpc = \function_exists('stream_socket_server') || \function_exists('posix_mkfifo');
++        if (!$this->ipcServer && $fdCanServeIpc) {
+             $this->ipcServer = new Server($this);
+             $this->ipcServer->setIpcPath($this->wrapper->getSession());
+         }
+-        $this->ipcServer->start();
++        if ($this->ipcServer) {
++            $this->ipcServer->start();
++        }
+         if (!isset($this->updateQueue)) {
+             $q = new SplQueue;
+             $q->setIteratorMode(SplQueue::IT_MODE_DELETE);

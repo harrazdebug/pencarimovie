@@ -1,0 +1,41 @@
+{
+  "name": "pencarimovie-server",
+  "description": "PencariMovie Server - Telegram file streamer and Stremio/Nuvio media addon",
+  "repository": "https://github.com/aiskendi/pencarimovie-server",
+  "keywords": [
+    "telegram",
+    "stremio",
+    "nuvio",
+    "frankenphp",
+    "madelineproto",
+    "streamer"
+  ],
+  "stack": "container",
+  "env": {
+    "SERVER_TOKEN": {
+      "description": "32-character static access token for public addon URLs (e.g. /<token>/manifest.json)",
+      "value": "66ff097863dedb7ccd8401d5ffe616f2",
+      "required": false
+    },
+    "SERVER_PASSWORD": {
+      "description": "Password for web dashboard access on public deployments",
+      "value": "123456",
+      "required": false
+    },
+    "PM_MAX_STREAMS": {
+      "description": "Concurrent /api/download bodies before 503 + Retry-After. The engine default is 0 (unlimited), which suits self-hosting; a PaaS with a short request timeout wants an explicit cap, because overflow past it dies on the router timeout (Heroku H12 at 30s) and returns an HTML error page instead of a retryable JSON 503.",
+      "value": "256",
+      "required": false
+    },
+    "BOT_TOKENS": {
+      "description": "Optional pool of Telegram bot tokens, comma/space/newline separated. Set this when running more than one instance: the bot pool file lives on each instance's own ephemeral disk, so a bot added in the dashboard is only used by the instance that stored it. With BOT_TOKENS every instance logs in all of them and downloads are spread across the pool.",
+      "value": "",
+      "required": false
+    }
+  },
+  "formation": {
+    "web": {
+      "quantity": 1
+    }
+  }
+}

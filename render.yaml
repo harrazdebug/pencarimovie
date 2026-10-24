@@ -1,0 +1,38 @@
+# Exported from Render on 2026-10-08T13:24:11Z
+#
+# IMPORTANT: this service runs a PREBUILT image, it does not build the repo.
+#
+# It used to be `runtime: docker` + `dockerfilePath: ./Dockerfile` with
+# `autoDeployTrigger: commit`, so every push to main made Render recompile the
+# whole Rust dependency tree (~5-10 min per push, because Render does not keep
+# the BuildKit `target/` cache mount between deploys). The repository already
+# publishes that image from `.github/workflows/release.yml` (manual workflow):
+#
+#   ghcr.io/aiskendi/pencarimovie-server:native   <- built AND smoke-tested there
+#                                                    (/api/version + dashboard)
+#   ghcr.io/aiskendi/pencarimovie-server:latest   <- same Dockerfile, multi-arch
+#                                                    (linux/amd64, linux/arm64)
+#
+# Both tags are anonymously pullable, so no registry credentials are needed.
+# Consequence: a push no longer deploys anything by itself. When you want Render
+# updated, run the "Release Builder & Docker Publish" workflow (leave the tag
+# empty to publish the image only), then redeploy this service.
+version: "1"
+services:
+  - type: web
+    name: pencarimovie-server
+    runtime: image
+    image:
+      url: ghcr.io/aiskendi/pencarimovie-server:native
+    plan: free
+    region: singapore
+    envVars:
+      - key: SERVER_TOKEN
+        sync: false
+      - key: SERVER_PASSWORD
+        sync: false
+      # Ephemeral disk: storage/catalog_settings.json is gone after every
+      # restart/redeploy, so the dashboard's catalog/upstream/stream config is
+      # supplied here instead (a JSON object; any subset of the file's keys).
+      - key: PM_CATALOG_SETTINGS
+        sync: false

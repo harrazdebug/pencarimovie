@@ -1,0 +1,946 @@
+//! Telegram transport on `grammers`.
+//!
+//! Live `Client`s are kept per bot and reused for every Range request — there is
+//! no out-of-process worker and no IPC layer, because grammers is a library.
+//! What matters here:
+//!
+//! * a session that survives restarts (a JSON file implementing `Session`),
+//! * a login path of its own (`auth.ImportBotAuthorization` via
+//!   `Client::bot_sign_in`, never a copied session),
+//! * a download primitive built on `iter_download()` + `chunk_size` /
+//!   `skip_chunks` (the per-connection Telegram primitive),
+//! * `FILE_REFERENCE_EXPIRED` surfaced as a typed error so the caller can
+//!   re-resolve once.
+//!
+//! ## One connection per DC per Client
+//! grammers multiplexes every request for a DC over that DC's connection. To
+//! get Telegram's recommended "separate connections" model, `--workers N`
+//! creates N independent `Client`s (each with its own `SenderPool`, therefore
+//! its own connection set), and requests pick one round-robin. That is the
+//! "N Clients" option the task allows; run N *processes* instead if you want
+//! hard isolation (measured in README.md).
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use grammers_client::media::Downloadable;
+use grammers_client::{Client, InvocationError, SenderPool};
+use grammers_session::types::{ChannelState, DcOption, PeerId, PeerInfo, UpdateState, UpdatesState};
+use grammers_session::{BoxFuture as SessFuture, Session, SessionData};
+use grammers_tl_types as tl;
+use serde::{Deserialize, Serialize};
+
+use crate::credentials::{fetch_credentials_from_wordpress, load_cached_api_credentials};
+use crate::fileid::{DecodedFileId, is_document_file_id, location_kind};
+use crate::log::log;
+use crate::storage::storage_path;
+
+/// The session file, kept per bot in `storage/sessions/<bot_id>/` with a name
+/// that cannot be mistaken for a session written by the old PHP server.
+pub const SESSION_FILE: &str = "session.rust.json";
+
+pub fn session_dir(bot_id: &str) -> PathBuf {
+    let safe: String = bot_id
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    storage_path(&format!("sessions/{}", safe))
+}
+
+pub fn has_session_file(bot_id: &str) -> bool {
+    if bot_id.trim().is_empty() {
+        return false;
+    }
+    session_dir(bot_id).join(SESSION_FILE).exists()
+}
+
+/* ── JSON session storage ────────────────────────────────────────────────── */
+
+#[derive(Debug)]
+pub struct SessionErr(String);
+
+impl std::fmt::Display for SessionErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for SessionErr {}
+
+#[derive(Serialize, Deserialize, Default)]
+struct DiskSession {
+    #[serde(default)]
+    home_dc: Option<i32>,
+    #[serde(default)]
+    dc_options: Vec<DcOption>,
+    #[serde(default)]
+    peer_infos: Vec<(PeerId, PeerInfo)>,
+    #[serde(default)]
+    updates_state: UpdatesState,
+}
+
+/// A `Session` backed by one JSON file. Every mutation is persisted at once
+/// (write to a temp file then rename) so a restart reuses the auth keys.
+pub struct JsonSession {
+    data: Mutex<SessionData>,
+    path: PathBuf,
+}
+
+impl JsonSession {
+    pub fn load(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let mut data = SessionData::default();
+        if let Ok(text) = fs::read_to_string(&path) {
+            if let Ok(d) = serde_json::from_str::<DiskSession>(&text) {
+                if let Some(h) = d.home_dc {
+                    data.home_dc = h;
+                }
+                for o in d.dc_options {
+                    data.dc_options.insert(o.id, o);
+                }
+                for (k, v) in d.peer_infos {
+                    data.peer_infos.insert(k, v);
+                }
+                data.updates_state = d.updates_state;
+            }
+        }
+        Self {
+            data: Mutex::new(data),
+            path,
+        }
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, SessionData>, SessionErr> {
+        self.data
+            .lock()
+            .map_err(|_| SessionErr("session lock poisoned".to_string()))
+    }
+
+    fn persist(&self, data: &SessionData) {
+        let disk = DiskSession {
+            home_dc: Some(data.home_dc),
+            dc_options: data.dc_options.values().cloned().collect(),
+            peer_infos: data.peer_infos.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            updates_state: data.updates_state.clone(),
+        };
+        if let Ok(text) = serde_json::to_string(&disk) {
+            let tmp = self.path.with_extension("json.tmp");
+            if fs::write(&tmp, text).is_ok() {
+                let _ = fs::rename(&tmp, &self.path);
+            }
+        }
+    }
+}
+
+impl Session for JsonSession {
+    type Error = SessionErr;
+
+    fn home_dc_id(&self) -> Result<i32, Self::Error> {
+        Ok(self.lock()?.home_dc)
+    }
+
+    fn set_home_dc_id(&self, dc_id: i32) -> SessFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move {
+            let mut d = self.lock()?;
+            d.home_dc = dc_id;
+            self.persist(&d);
+            Ok(())
+        })
+    }
+
+    fn dc_option(&self, dc_id: i32) -> Result<Option<DcOption>, Self::Error> {
+        Ok(self.lock()?.dc_options.get(&dc_id).cloned())
+    }
+
+    fn set_dc_option(&self, dc_option: &DcOption) -> SessFuture<'_, Result<(), Self::Error>> {
+        let opt = dc_option.clone();
+        Box::pin(async move {
+            let mut d = self.lock()?;
+            d.dc_options.insert(opt.id, opt.clone());
+            self.persist(&d);
+            Ok(())
+        })
+    }
+
+    fn peer(&self, peer: PeerId) -> SessFuture<'_, Result<Option<PeerInfo>, Self::Error>> {
+        Box::pin(async move { Ok(self.lock()?.peer_infos.get(&peer).cloned()) })
+    }
+
+    fn cache_peer(&self, peer: PeerInfo) -> SessFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move {
+            let mut d = self.lock()?;
+            let id = peer.id();
+            match d.peer_infos.get_mut(&id) {
+                Some(existing) => {
+                    existing.extend_info(&peer);
+                }
+                None => {
+                    d.peer_infos.insert(id, peer.clone());
+                }
+            }
+            self.persist(&d);
+            Ok(())
+        })
+    }
+
+    fn updates_state(&self) -> SessFuture<'_, Result<UpdatesState, Self::Error>> {
+        Box::pin(async move { Ok(self.lock()?.updates_state.clone()) })
+    }
+
+    fn set_update_state(&self, update: UpdateState) -> SessFuture<'_, Result<(), Self::Error>> {
+        Box::pin(async move {
+            let mut d = self.lock()?;
+            match update {
+                UpdateState::All(state) => d.updates_state = state,
+                UpdateState::Primary { pts, date, seq } => {
+                    d.updates_state.pts = pts;
+                    d.updates_state.date = date;
+                    d.updates_state.seq = seq;
+                }
+                UpdateState::Secondary { qts } => d.updates_state.qts = qts,
+                UpdateState::Channel { id, pts } => {
+                    d.updates_state.channels.retain(|c| c.id != id);
+                    d.updates_state.channels.push(ChannelState { id, pts });
+                }
+            }
+            self.persist(&d);
+            Ok(())
+        })
+    }
+}
+
+/* ── live clients ────────────────────────────────────────────────────────── */
+
+#[derive(Clone, Default, Debug)]
+pub struct BotIdentity {
+    pub id: String,
+    pub username: String,
+    pub first_name: String,
+}
+
+pub struct BotEntry {
+    pub identity: BotIdentity,
+    clients: Vec<Client>,
+    /// One gate per `Client`. grammers multiplexes every request for a DC over
+    /// that DC's single connection, and the DC resets it once more than a
+    /// handful of `upload.getFile` parts are outstanding on it (measured:
+    /// 914 x "Connection reset by peer (os error 104)" with 200 concurrent
+    /// downloads). Each gate therefore bounds in-flight parts per CONNECTION,
+    /// so `--workers 8 --inflight 8` is 64 in flight across 8 connections,
+    /// which is the shape Telegram documents.
+    gates: Vec<Arc<tokio::sync::Semaphore>>,
+    next: AtomicUsize,
+}
+
+impl BotEntry {
+    fn pick_index(&self) -> usize {
+        self.next.fetch_add(1, Ordering::Relaxed) % self.clients.len()
+    }
+    pub fn pick(&self) -> Client {
+        self.clients[self.pick_index()].clone()
+    }
+    /// The `Client` and the in-flight gate that belongs to it. Both must be
+    /// taken in one call so a request cannot end up holding another
+    /// connection's permit.
+    pub fn pick_slot(&self) -> (Client, Arc<tokio::sync::Semaphore>) {
+        let i = self.pick_index();
+        (self.clients[i].clone(), self.gates[i].clone())
+    }
+    pub fn client_count(&self) -> usize {
+        self.clients.len()
+    }
+}
+
+fn live_tasks() -> &'static Mutex<Vec<tokio::task::JoinHandle<()>>> {
+    static T: std::sync::OnceLock<Mutex<Vec<tokio::task::JoinHandle<()>>>> = std::sync::OnceLock::new();
+    T.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn live_clients() -> &'static Mutex<Vec<Client>> {
+    static C: std::sync::OnceLock<Mutex<Vec<Client>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+pub fn disconnect_all() {
+    if let Ok(mut tasks) = live_tasks().lock() {
+        for t in tasks.drain(..) {
+            t.abort();
+        }
+    }
+    if let Ok(mut clients) = live_clients().lock() {
+        clients.clear();
+    }
+}
+
+pub struct TelegramPool {
+    workers: usize,
+    inflight: usize,
+    bots: tokio::sync::Mutex<HashMap<String, Arc<BotEntry>>>,
+    boot_lock: tokio::sync::Mutex<()>,
+}
+
+impl TelegramPool {
+    pub fn new(workers: usize, inflight: usize) -> Self {
+        Self {
+            workers: workers.max(1),
+            inflight: inflight.max(1),
+            bots: tokio::sync::Mutex::new(HashMap::new()),
+            boot_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    pub fn workers(&self) -> usize {
+        self.workers
+    }
+
+    pub fn inflight(&self) -> usize {
+        self.inflight
+    }
+
+    pub fn cached(&self) -> Option<Arc<BotEntry>> {
+        None
+    }
+
+    pub async fn get(&self, bot_id: &str) -> Option<Arc<BotEntry>> {
+        self.bots.lock().await.get(bot_id.trim()).cloned()
+    }
+
+    /// Boot (or reuse) the clients for this bot.
+    ///
+    /// With a token the call performs its own login
+    /// (`auth.ImportBotAuthorization`) and persists the session; without one it
+    /// resumes the stored session.
+    pub async fn boot(&self, bot_id: &str, token: Option<&str>) -> Result<Arc<BotEntry>, String> {
+        let key = bot_id.trim().to_string();
+        if key.is_empty() {
+            return Err("bot_id is required".to_string());
+        }
+        if let Some(entry) = self.bots.lock().await.get(&key).cloned() {
+            if token.is_none() {
+                return Ok(entry);
+            }
+            let client = entry.pick();
+            if client.is_authorized().await.unwrap_or(false) {
+                return Ok(entry);
+            }
+        }
+
+        let _guard = self.boot_lock.lock().await;
+        if let Some(entry) = self.bots.lock().await.get(&key).cloned() {
+            return Ok(entry);
+        }
+
+        let mut creds = load_cached_api_credentials();
+        if creds.is_none() {
+            if let Some(t) = token {
+                creds = fetch_credentials_from_wordpress(t).await;
+            }
+        }
+        let (api_id, api_hash) = creds.ok_or_else(|| {
+            "API credentials are missing: storage/api_credentials.json not found and WordPress returned none."
+                .to_string()
+        })?;
+
+        let dir = session_dir(&key);
+        fs::create_dir_all(&dir)
+            .map_err(|e| format!("could not create session dir {}: {}", dir.display(), e))?;
+        let base = dir.join(SESSION_FILE);
+
+        let (client, task) = make_client(&base, api_id).await?;
+        let authorized = client.is_authorized().await.map_err(|e| e.to_string())?;
+        if !authorized {
+            let tok = token.ok_or_else(|| {
+                "No valid Telegram session. Provisioning a bot is required.".to_string()
+            })?;
+            // auth.importBotAuthorization, exactly what grammers sends.
+            client
+                .bot_sign_in(tok, &api_hash)
+                .await
+                .map_err(|e| format!("bot sign-in failed: {}", e))?;
+        }
+
+        let users = client
+            .invoke(&tl::functions::users::GetUsers {
+                id: vec![tl::enums::InputUser::UserSelf],
+            })
+            .await
+            .map_err(|e| format!("getSelf failed: {}", e))?;
+        let (id, username, first_name) = match users.first() {
+            Some(tl::enums::User::User(u)) => (
+                u.id,
+                u.username.clone().unwrap_or_default(),
+                u.first_name.clone().unwrap_or_default(),
+            ),
+            _ => (0, String::new(), String::new()),
+        };
+        let identity = BotIdentity {
+            id: if id == 0 { key.clone() } else { id.to_string() },
+            username,
+            first_name,
+        };
+
+        let mut clients = vec![client];
+        let mut tasks = vec![task];
+        // Extra clients: copies of the SAME session file, one connection set
+        // each. Copying (rather than logging in N times) avoids N flood-waits
+        // and matches what a multi-connection client does with one auth key.
+        for i in 1..self.workers {
+            let extra = dir.join(format!("session.rust.w{}.json", i));
+            if base.exists() {
+                let _ = fs::copy(&base, &extra);
+            }
+            match make_client(&extra, api_id).await {
+                Ok((c, t)) => {
+                    clients.push(c);
+                    tasks.push(t);
+                }
+                Err(e) => {
+                    log("extra worker client failed", &serde_json::json!({"error": e, "worker": i}));
+                }
+            }
+        }
+
+        {
+            let mut live = live_clients().lock().map_err(|_| "lock".to_string())?;
+            live.extend(clients.iter().cloned());
+        }
+        if let Ok(mut lt) = live_tasks().lock() {
+            lt.extend(tasks);
+        }
+
+        let gates: Vec<Arc<tokio::sync::Semaphore>> = clients
+            .iter()
+            .map(|_| Arc::new(tokio::sync::Semaphore::new(self.inflight)))
+            .collect();
+        let entry = Arc::new(BotEntry {
+            identity: identity.clone(),
+            clients,
+            gates,
+            next: AtomicUsize::new(0),
+        });
+        self.bots.lock().await.insert(key.clone(), entry.clone());
+        if !identity.id.is_empty() && identity.id != key {
+            self.bots.lock().await.insert(identity.id.clone(), entry.clone());
+            let real_dir = session_dir(&identity.id);
+            if !real_dir.exists() && dir.exists() {
+                let _ = fs::create_dir_all(&real_dir);
+                if let Ok(entries) = fs::read_dir(&dir) {
+                    for e in entries.flatten() {
+                        let _ = fs::copy(e.path(), real_dir.join(e.file_name()));
+                    }
+                }
+            }
+        }
+        log(
+            "telegram session resumed",
+            &serde_json::json!({
+                "bot_id": key,
+                "username": identity.username,
+                "workers": entry.client_count(),
+                "inflight_per_connection": self.inflight,
+                "inflight_total": entry.client_count() * self.inflight
+            }),
+        );
+        Ok(entry)
+    }
+
+    pub async fn boot_with_token(&self, token: &str, hint: &str) -> Result<Arc<BotEntry>, String> {
+        self.boot(hint, Some(token)).await
+    }
+}
+
+async fn make_client(path: &Path, api_id: i32) -> Result<(Client, tokio::task::JoinHandle<()>), String> {
+    let session = Arc::new(JsonSession::load(path));
+    let SenderPool { runner, handle, .. } = SenderPool::new(session, api_id);
+    let client = Client::new(handle);
+    let task = tokio::spawn(runner.run());
+    Ok((client, task))
+}
+
+/* ── download primitive ──────────────────────────────────────────────────── */
+
+#[derive(Clone)]
+pub struct DocTarget {
+    pub dc_id: i32,
+    pub size: u64,
+    pub location: tl::enums::InputFileLocation,
+}
+
+impl Downloadable for DocTarget {
+    fn to_raw_input_location(&self) -> Option<tl::enums::InputFileLocation> {
+        Some(self.location.clone())
+    }
+    fn size(&self) -> Option<usize> {
+        if self.size == 0 {
+            None
+        } else {
+            Some(self.size as usize)
+        }
+    }
+    fn dc_id(&self) -> Option<i32> {
+        Some(self.dc_id)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GramErr {
+    pub message: String,
+    /// `FILE_REFERENCE_EXPIRED` / `FILE_MIGRATE_*`: the caller re-resolves once.
+    pub file_reference: bool,
+    /// `FLOOD_WAIT_<n>` seconds. Surfaced as HTTP 429, never as a 5xx: a client
+    /// reads 5xx/404 as fatal and never retries (root AGENTS.md: "A rate limit
+    /// must answer 429, not 404").
+    pub flood_wait: Option<u64>,
+    /// A connection-level failure (reset / 0 bytes / broken pipe) that is worth
+    /// retrying on the same part.
+    pub transport: bool,
+}
+
+impl Default for GramErr {
+    fn default() -> Self {
+        Self {
+            message: String::new(),
+            file_reference: false,
+            flood_wait: None,
+            transport: false,
+        }
+    }
+}
+
+impl std::fmt::Display for GramErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+/// Does this message look like the DC dropping the connection rather than a
+/// logical failure? Matched on the text because grammers reports the same
+/// condition as `Io`, `Transport` or `Deserialize` depending on where it broke.
+pub fn is_transport_reset(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    const NEEDLES: [&str; 10] = [
+        "connection reset",
+        "reset by peer",
+        "read 0 bytes",
+        "broken pipe",
+        "os error 104",
+        "os error 32",
+        "unexpected eof",
+        "connection closed",
+        "connection aborted",
+        "early eof",
+    ];
+    NEEDLES.iter().any(|n| m.contains(n))
+}
+
+pub fn map_invocation_error(e: InvocationError) -> GramErr {
+    match &e {
+        InvocationError::Rpc(rpc) => {
+            // grammers strips the digits out of the name into `value`, so
+            // `FLOOD_WAIT_420` arrives as name "FLOOD_WAIT" + value Some(420).
+            let flood_wait = if rpc.is("FLOOD_WAIT")
+                || rpc.is("FLOOD_WAIT_*")
+                || rpc.is("FLOOD_PREMIUM_WAIT_*")
+                || rpc.code == 420
+            {
+                Some(rpc.value.map(u64::from).unwrap_or(0))
+            } else {
+                None
+            };
+            GramErr {
+                message: format!("{} ({})", rpc.name, rpc.code),
+                file_reference: rpc.name.contains("FILE_REFERENCE") || rpc.name.contains("FILE_MIGRATE"),
+                flood_wait,
+                transport: false,
+            }
+        }
+        other => {
+            let message = other.to_string();
+            GramErr {
+                transport: is_transport_reset(&message),
+                message,
+                file_reference: false,
+                flood_wait: None,
+            }
+        }
+    }
+}
+
+/// Reject the shapes a media stream cannot use (`prepareFileTarget`).
+pub fn prepare_file_target(file_id_mt: &str, size: u64) -> Result<DocTarget, String> {
+    let mut decoded: DecodedFileId = crate::fileid::decode_file_id(file_id_mt)?;
+    decoded.size = size;
+    if !is_document_file_id(&decoded) {
+        return Err(format!(
+            "file_id type \"{}\" is not a downloadable document",
+            decoded.type_name
+        ));
+    }
+    if location_kind(&decoded) != "document" {
+        return Err("unsupported file location".to_string());
+    }
+    Ok(DocTarget {
+        dc_id: decoded.dc_id,
+        size,
+        location: tl::enums::InputFileLocation::InputDocumentFileLocation(
+            tl::types::InputDocumentFileLocation {
+                id: decoded.id,
+                access_hash: decoded.access_hash,
+                file_reference: decoded.file_reference.unwrap_or_default(),
+                thumb_size: String::new(),
+            },
+        ),
+    })
+}
+
+pub const MIN_CHUNK: u64 = 4096;
+pub const MAX_CHUNK: u64 = 512 * 1024;
+pub const MB: u64 = 1024 * 1024;
+
+/// Largest `4096 * 2^k` (k = 0..7) that is <= `want`, <= 512 KB, divides
+/// `limit_pos` and does not cross the next 1 MB boundary. Telegram's
+/// alignment rules: offset/limit divisible by 4096, a part must not cross a
+/// 1 MB boundary, `1048576 % limit == 0`, `limit <= 1 MB`.
+pub fn plan_limit(pos: u64, want: u64) -> u64 {
+    let boundary = MB - (pos % MB);
+    let cap = want.min(boundary).min(MAX_CHUNK);
+    let mut best = 0u64;
+    let mut v = MIN_CHUNK;
+    while v <= cap {
+        if pos % v == 0 {
+            best = v;
+        }
+        v *= 2;
+    }
+    if best == 0 {
+        MIN_CHUNK
+    } else {
+        best
+    }
+}
+
+/// Attempts for one part: the first try plus two retries.
+const PART_MAX_ATTEMPTS: usize = 3;
+/// 100 / 300 / 700 ms between transport retries.
+const PART_BACKOFF_MS: [u64; 3] = [100, 300, 700];
+/// A `FLOOD_WAIT` at or below this is slept and retried once (inside the same
+/// permit); above it the caller answers 429 so the client retries on its own
+/// schedule instead of holding a connection for minutes.
+pub const FLOOD_WAIT_RETRY_MAX_SECS: u64 = 30;
+
+/// Fetch `want` bytes starting at an already 4096-aligned `pos`, ungated.
+pub async fn fetch_range(client: &Client, target: &DocTarget, pos: u64, want: u64) -> Result<Vec<u8>, GramErr> {
+    fetch_range_core(client, None, target, pos, want).await
+}
+
+/// Same, but at most `gate` parts run at once on this `Client`'s connection.
+/// Requests QUEUE for a permit — they never fail because the gate is full.
+pub async fn fetch_range_gated(
+    client: &Client,
+    gate: &tokio::sync::Semaphore,
+    target: &DocTarget,
+    pos: u64,
+    want: u64,
+) -> Result<Vec<u8>, GramErr> {
+    fetch_range_core(client, Some(gate), target, pos, want).await
+}
+
+async fn fetch_range_core(
+    client: &Client,
+    gate: Option<&tokio::sync::Semaphore>,
+    target: &DocTarget,
+    pos: u64,
+    want: u64,
+) -> Result<Vec<u8>, GramErr> {
+    if want == 0 {
+        return Ok(Vec::new());
+    }
+    let limit = plan_limit(pos, want);
+    let skip = pos / limit;
+    if skip > i32::MAX as u64 {
+        return Err(GramErr {
+            message: format!("offset {} beyond supported chunk index", pos),
+            ..Default::default()
+        });
+    }
+
+    // The permit bounds how many parts THIS CONNECTION has outstanding. It is
+    // held across every retry below, so a retrying part cannot multiply the
+    // connection's load.
+    let _permit = match gate {
+        Some(g) => Some(g.acquire().await.map_err(|_| GramErr {
+            message: "download gate closed".to_string(),
+            ..Default::default()
+        })?),
+        None => None,
+    };
+
+    let mut transport_attempts = 0usize;
+    let mut flood_retried = false;
+    loop {
+        match fetch_range_once(client, target, limit, skip, want).await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if let Some(secs) = e.flood_wait {
+                    if !flood_retried && secs <= FLOOD_WAIT_RETRY_MAX_SECS {
+                        flood_retried = true;
+                        log(
+                            "upload.getFile rate limited, sleeping then retrying part",
+                            &serde_json::json!({"flood_wait_seconds": secs, "pos": pos}),
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(secs + 1)).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+                // FILE_REFERENCE_EXPIRED keeps its single re-resolve path in the
+                // caller — it is never a transport problem.
+                if e.file_reference || !e.transport {
+                    return Err(e);
+                }
+                transport_attempts += 1;
+                if transport_attempts >= PART_MAX_ATTEMPTS {
+                    return Err(e);
+                }
+                let delay = PART_BACKOFF_MS[(transport_attempts - 1).min(PART_BACKOFF_MS.len() - 1)];
+                log(
+                    "upload.getFile transport reset, retrying part",
+                    &serde_json::json!({
+                        "attempt": transport_attempts,
+                        "backoff_ms": delay,
+                        "error": e.message,
+                        "pos": pos,
+                    }),
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
+        }
+    }
+}
+
+async fn fetch_range_once(
+    client: &Client,
+    target: &DocTarget,
+    limit: u64,
+    skip: u64,
+    want: u64,
+) -> Result<Vec<u8>, GramErr> {
+    let mut iter = client
+        .iter_download(target)
+        .chunk_size(limit as i32)
+        .skip_chunks(skip as i32);
+    let mut out: Vec<u8> = Vec::with_capacity(want as usize);
+    while (out.len() as u64) < want {
+        match iter.next().await {
+            Ok(Some(chunk)) => {
+                if chunk.is_empty() {
+                    break;
+                }
+                out.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(e) => return Err(map_invocation_error(e)),
+        }
+    }
+    out.truncate(want as usize);
+    Ok(out)
+}
+
+/// A single aligned chunk, for the concurrency benchmark (one range request per
+/// task, no streaming).
+pub async fn fetch_one_chunk(client: &Client, target: &DocTarget, pos: u64, want: u64) -> Result<usize, GramErr> {
+    let data = fetch_range(client, target, pos, want).await?;
+    Ok(data.len())
+}
+
+#[cfg(test)]
+impl BotEntry {
+    pub fn new_test_entry(bot_id: &str, workers: usize, inflight: usize) -> Self {
+        let dummy_path = std::env::temp_dir().join(format!("pm_test_sess_{}.json", bot_id));
+        let session = Arc::new(JsonSession::load(&dummy_path));
+        let mut clients = Vec::new();
+        for _ in 0..workers {
+            let SenderPool { handle, .. } = SenderPool::new(session.clone(), 12345);
+            clients.push(Client::new(handle));
+        }
+        let gates = (0..workers)
+            .map(|_| Arc::new(tokio::sync::Semaphore::new(inflight)))
+            .collect();
+        Self {
+            identity: BotIdentity {
+                id: bot_id.to_string(),
+                username: format!("{}_bot", bot_id),
+                first_name: format!("Bot {}", bot_id),
+            },
+            clients,
+            gates,
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn available_permits_per_worker(&self) -> Vec<usize> {
+        self.gates.iter().map(|g| g.available_permits()).collect()
+    }
+
+    pub fn total_available_permits(&self) -> usize {
+        self.gates.iter().map(|g| g.available_permits()).sum()
+    }
+}
+
+#[cfg(test)]
+impl TelegramPool {
+    pub async fn insert_test_entry(&self, bot_id: &str, entry: Arc<BotEntry>) {
+        self.bots.lock().await.insert(bot_id.trim().to_string(), entry);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workers_and_inflight_allocated_independently_per_bot() {
+        let workers = 4;
+        let inflight = 8;
+        let pool = TelegramPool::new(workers, inflight);
+        assert_eq!(pool.workers(), 4);
+        assert_eq!(pool.inflight(), 8);
+
+        let bot_a = Arc::new(BotEntry::new_test_entry("bot_111", workers, inflight));
+        let bot_b = Arc::new(BotEntry::new_test_entry("bot_222", workers, inflight));
+
+        assert_eq!(bot_a.client_count(), 4);
+        assert_eq!(bot_b.client_count(), 4);
+
+        // Each bot has 4 worker connections, each with 8 inflight permits (total 32 each).
+        assert_eq!(bot_a.available_permits_per_worker(), vec![8, 8, 8, 8]);
+        assert_eq!(bot_b.available_permits_per_worker(), vec![8, 8, 8, 8]);
+        assert_eq!(bot_a.total_available_permits(), 32);
+        assert_eq!(bot_b.total_available_permits(), 32);
+    }
+
+    #[test]
+    fn pick_slot_cycles_workers_independently() {
+        let workers = 3;
+        let inflight = 5;
+        let bot_a = BotEntry::new_test_entry("bot_a", workers, inflight);
+        let bot_b = BotEntry::new_test_entry("bot_b", workers, inflight);
+
+        // Advance Bot A two times (slots 0, 1)
+        let (_, gate_a0) = bot_a.pick_slot();
+        let (_, gate_a1) = bot_a.pick_slot();
+        assert_eq!(Arc::strong_count(&gate_a0), 2); // 1 in bot_a.gates + 1 returned
+        assert_eq!(Arc::strong_count(&gate_a1), 2);
+
+        // Bot B starts at slot 0 regardless of Bot A's actions
+        assert_eq!(bot_b.pick_index(), 0);
+        assert_eq!(bot_b.pick_index(), 1);
+
+        // Bot A's next slot is 2, then wraps to 0
+        assert_eq!(bot_a.pick_index(), 2);
+        assert_eq!(bot_a.pick_index(), 0);
+    }
+
+    #[tokio::test]
+    async fn bot_a_saturation_does_not_affect_bot_b_inflight() {
+        let workers = 4;
+        let inflight = 8;
+        let pool = TelegramPool::new(workers, inflight);
+
+        let bot_a = Arc::new(BotEntry::new_test_entry("bot_a", workers, inflight));
+        let bot_b = Arc::new(BotEntry::new_test_entry("bot_b", workers, inflight));
+
+        pool.insert_test_entry("bot_a", bot_a.clone()).await;
+        pool.insert_test_entry("bot_b", bot_b.clone()).await;
+
+        // Saturate Bot A completely by acquiring all 32 permits (4 workers * 8 inflight)
+        let mut held_permits_a = Vec::new();
+        for _ in 0..(workers * inflight) {
+            let (_, gate) = bot_a.pick_slot();
+            let permit = gate.try_acquire_owned().expect("Bot A permit should be available");
+            held_permits_a.push(permit);
+        }
+
+        // Verify Bot A is 100% saturated
+        assert_eq!(bot_a.total_available_permits(), 0);
+        assert_eq!(bot_a.available_permits_per_worker(), vec![0, 0, 0, 0]);
+
+        // Attempting to acquire another permit on Bot A must fail immediately
+        let (_, gate_a) = bot_a.pick_slot();
+        assert!(gate_a.try_acquire().is_err());
+
+        // Bot B must be completely unaffected: full 32 permits (8 per worker) remain available!
+        assert_eq!(bot_b.total_available_permits(), 32);
+        assert_eq!(bot_b.available_permits_per_worker(), vec![8, 8, 8, 8]);
+
+        // Bot B can acquire all its permits concurrently
+        let mut held_permits_b = Vec::new();
+        for _ in 0..(workers * inflight) {
+            let (_, gate) = bot_b.pick_slot();
+            let permit = gate.try_acquire_owned().expect("Bot B permit must be independent and available");
+            held_permits_b.push(permit);
+        }
+        assert_eq!(bot_b.total_available_permits(), 0);
+
+        // Release Bot A's permits
+        drop(held_permits_a);
+        assert_eq!(bot_a.total_available_permits(), 32);
+
+        // Bot B remains saturated until its own permits are dropped
+        assert_eq!(bot_b.total_available_permits(), 0);
+        drop(held_permits_b);
+        assert_eq!(bot_b.total_available_permits(), 32);
+    }
+
+    #[tokio::test]
+    async fn concurrent_tasks_across_bots_run_independently() {
+        let workers = 4;
+        let inflight = 8;
+        let bot_a = Arc::new(BotEntry::new_test_entry("bot_1", workers, inflight));
+        let bot_b = Arc::new(BotEntry::new_test_entry("bot_2", workers, inflight));
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(65)); // 32 from bot_a + 32 from bot_b + main coordinator
+
+        let mut handles = Vec::new();
+
+        // Spawn 32 concurrent workers on Bot A
+        for _ in 0..32 {
+            let bot = bot_a.clone();
+            let b = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                let (_, gate) = bot.pick_slot();
+                let _permit = gate.acquire().await.unwrap();
+                b.wait().await;
+            }));
+        }
+
+        // Spawn 32 concurrent workers on Bot B
+        for _ in 0..32 {
+            let bot = bot_b.clone();
+            let b = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                let (_, gate) = bot.pick_slot();
+                let _permit = gate.acquire().await.unwrap();
+                b.wait().await;
+            }));
+        }
+
+        // The barrier will only be satisfied if ALL 64 tasks across BOTH bots
+        // acquired their permits concurrently! If inflight was shared across bots,
+        // it would cap at 32 and deadlock here.
+        tokio::time::timeout(std::time::Duration::from_secs(3), barrier.wait())
+            .await
+            .expect("All 64 tasks across both bots must acquire permits concurrently without deadlock");
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert_eq!(bot_a.total_available_permits(), 32);
+        assert_eq!(bot_b.total_available_permits(), 32);
+    }
+}

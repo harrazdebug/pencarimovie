@@ -1,0 +1,95 @@
+{
+	# Production/PaaS (Render, Docker, VPS): the admin API on :2019 is unused
+	# and Caddy rejects Host headers other than localhost, which makes Render's
+	# internal HEAD / health check log `host not allowed: *.onrender.com` 403.
+	admin off
+	auto_https off
+	frankenphp {
+		# Concurrency & thread pool (tuned for low-end VPS / devices: 1GB-2GB RAM, 1-2 vCPUs):
+		#   - Starts with 8 worker threads, scaling up to 16 threads under load.
+		#   - At ~30-50MB per thread, 16 threads caps memory usage under 600MB RAM.
+		#   - Idle threads above num_threads are automatically reclaimed after 10s.
+		#   - High-end multi-core servers can override via FRANKENPHP_NUM_THREADS=16 FRANKENPHP_MAX_THREADS=64.
+		num_threads {$FRANKENPHP_NUM_THREADS:8}
+		max_threads {$FRANKENPHP_MAX_THREADS:16}
+		max_idle_time 10s
+
+		# Limit per-request memory usage to prevent runaway heap allocations.
+		php_ini memory_limit {$PHP_MEMORY_LIMIT:512M}
+
+		# Disable PHP execution timeout so long-running media streams (movies, music)
+		# and large file downloads are never abruptly terminated mid-playback.
+		php_ini max_execution_time 0
+
+		# Cap how long a queued request waits for a thread during extreme spikes before failing fast.
+		max_wait_time {$FRANKENPHP_MAX_WAIT_TIME:30s}
+	}
+	order php_server before file_server
+	servers {
+		enable_full_duplex
+		timeouts {
+			read_body 10m
+			read_header 30s
+			write 0
+			idle 2m
+		}
+	}
+}
+
+# NOTE: keep this as a bare `:8088` port, NOT `localhost:8088`.
+#
+# Caddy only enables automatic HTTPS for site blocks with a HOSTNAME. A bare
+# `:8088` is treated as a plain HTTP listener, which is exactly what this
+# project needs:
+#   - Stremio/Nuvio install an `http://` transport URL for LAN/localhost.
+#     An HTTPS redirect would break addon installation.
+#   - Caddy's local CA is not trusted by Stremio, Nuvio, or Android, so a
+#     self-signed cert would fail TLS validation on every client.
+#   - Android/Termux often has no working CA bundle at all.
+#   - HTTPS is already available when needed via the Cloudflare tunnel
+#     (POST /api/tunnel/enable), which serves a publicly-trusted cert.
+#
+# Changing this to `localhost:8088` would silently enable auto-HTTPS and
+# redirect HTTP -> HTTPS, breaking every LAN client.
+:{$PORT:8088} {
+	root * .
+	encode zstd gzip
+
+	# Security: block direct HTTP access to internal directories, hidden files, and source configs
+	@blocked path /storage/* /vendor/* /bin/* /patches/* /src/* /.* /Caddyfile* /*.sh /*.bat /*.key /*.log /*.lock /*.md /*.yml /*.yaml /composer.json /package.json /app.json
+	error @blocked 404
+
+	# Serve static assets directly via native Go file_server without using PHP worker threads
+	@static_public path /app.js /stream-theme.css /styles.css
+	handle @static_public {
+		root * public
+		file_server
+	}
+
+	@static_dir path /public/*
+	handle @static_dir {
+		file_server
+	}
+
+
+	@empty_static path /favicon.ico /robots.txt
+	handle @empty_static {
+		respond "" 204
+	}
+
+	# Rewrite 32-hex token prefixes directly to index.php (e.g. /<token>/manifest.json -> /index.php)
+	# so FrankenPHP handles the tokenized route instead of failing try_files on disk.
+	@tokenized path_regexp token ^/[0-9a-fA-F]{32}(/.*)?$
+	rewrite @tokenized index.php
+
+	php_server {
+		resolve_root_symlink false
+		try_files {path} index.php
+		# NOTE: do NOT add `request_body_timeout` here. This FrankenPHP build's
+		# php_server only accepts: hot_reload, name, root, split, env,
+		# resolve_root_symlink, worker. Adding it fails config adaptation with
+		# `unknown "php or php_server" subdirective: request_body_timeout` and
+		# the server never starts. The request-body idle cutoff is already set
+		# globally via `servers { timeouts { read_body 10m } }` above.
+	}
+}

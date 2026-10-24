@@ -1,0 +1,408 @@
+AGENTS.md
+HANDOFF.md
+
+# Dependencies installed locally; release artifacts may bundle vendor/ separately.
+vendor/
+
+# Composer bootstrap helpers. install.bat / install.sh fall back to a global
+# `composer` when these are absent, so they are not needed in the repo.
+composer-setup.php
+composer.phar
+
+# Unused legacy Node static server (npm start runs start.bat -> FrankenPHP).
+server.js
+
+# Local-only catalog ID backfill tooling (talks to the WordPress REST API).
+backfill-ids.php
+backfill-ids.bat
+
+# Superseded by pencarimovie-termux.sh.
+pencarimovie-termux-test.sh
+
+# Bundled native runtime binaries (distributed via GitHub releases, not committed
+# directly). These belong to the ARCHIVED PHP tree's FrankenPHP runtime, which
+# lives in legacy/php/bin/ now.
+legacy/php/bin/*.exe
+legacy/php/bin/*.dll
+legacy/php/bin/*.lib
+legacy/php/bin/*.so*
+legacy/php/bin/dev/
+legacy/php/bin/ext/
+legacy/php/bin/extras/
+legacy/php/bin/lib/
+legacy/php/bin/proot-*
+legacy/php/bin/snapshot.txt
+legacy/php/bin/news.txt
+legacy/php/bin/license.txt
+legacy/php/bin/readme-redist-bins.txt
+legacy/php/bin/deplister.exe
+legacy/php/bin/pharcommand.phar
+
+# Local secrets and runtime state.
+.release-tag
+storage/tray.pid
+storage/tray.log
+storage/tunnel/
+storage/bin/
+storage/bin/cloudflared
+storage/bin/cloudflared.exe
+storage/bin/cloudflared*
+storage/config.json
+storage/api_credentials.json
+storage/api_secret.key
+storage/bot_id.txt
+storage/session_meta.json
+storage/version_check.json
+storage/device_id.txt
+storage/.secret.key
+storage/session.madeline/
+storage/session.madeline*
+storage/*.madeline
+storage/sessions/
+storage/bot_pool.json
+storage/cache/
+storage/resolve_cache_*.json
+storage/rr_bot_index.txt
+storage/cat-*.json
+storage/stream-*.json
+storage/aiostreams/
+storage/auth.json
+storage/auth_lockout.json
+storage/title_imdb_*.txt
+storage/sub_vtt_*.vtt
+storage/scrape_stamps/
+storage/manifest_hosts.json
+storage/server_country.json
+storage/version_cache.json
+storage/backfill_ids_state.json
+storage/benchmark-result.txt
+storage/debug_mode.txt
+storage/_aio_manifest.json
+storage/_probe.php
+storage/eclipse*
+storage/wesper/
+storage/stremio-web/
+storage/ffmpeg-*
+storage/NuvioTVSmart/
+test_runner_all.py
+check_sponsor_settings.py
+test_tt_stream.json
+clean-posts-*.php
+clean-posts-*.sh
+find_unused.php
+start-clean.sh
+legacy/php/bin/su
+.bun-cache/
+stremio_kb.txt
+errors_db.txt
+*.zip
+*.tar
+*.tar.gz
+*.deb
+*.apk
+5])
+9000014421])
+storage/*.madeline.lock
+storage/*.madeline.safe.php
+
+# Android project.
+#
+# android/termux-app-fork and android/termux-app-fork-x86_64 ARE tracked: the
+# GitHub Actions workflow .github/workflows/android-apk.yml builds them, so the
+# source must be in the repository. The older android/ project (Phase 1/2,
+# proot-distro + rootfs) stays excluded.
+#
+# NOTE: the re-include rules for these two projects live at the END of this
+# file. Git evaluates patterns in order and does not descend into an excluded
+# directory, so negations must come after every broad rule that would match
+# (pencarimovie*, *.zip, *.jks).
+android/*
+
+# Build output and IDE state inside the tracked Android projects.
+android/termux-app-fork/build/
+android/termux-app-fork/app/build/
+android/termux-app-fork/.gradle/
+android/termux-app-fork/.gradle_cache/
+android/termux-app-fork/.gradle_home/
+android/termux-app-fork/.gradle_user_home/
+android/termux-app-fork/.kotlin/
+android/termux-app-fork/.idea/
+android/termux-app-fork/local.properties
+android/termux-app-fork-x86_64/build/
+android/termux-app-fork-x86_64/app/build/
+android/termux-app-fork-x86_64/.gradle/
+android/termux-app-fork-x86_64/.gradle_cache/
+android/termux-app-fork-x86_64/.gradle_home/
+android/termux-app-fork-x86_64/.gradle_user_home/
+android/termux-app-fork-x86_64/.kotlin/
+android/termux-app-fork-x86_64/.idea/
+android/termux-app-fork-x86_64/local.properties
+
+build-proot-termux.sh
+build-rootfs-termux.sh
+scripts/package-android.*
+scripts/build-bootstrap.ps1
+
+# `docs/` is TRACKED now: it holds the architecture notes the README points at.
+# (It used to be ignored as scratch space.)
+#
+# References and sub-repos
+references/
+
+# Internal plans & development notes
+plans/
+
+# Internal release build scripts. The PHP packagers moved to
+# legacy/php/scripts/ (already tracked, so no negation is needed for them).
+# `scripts/` now holds only local build tooling - the Rust distribution build
+# (build-rust-android.sh) and the APK driver (build-rust-apk.bat) - which is
+# deliberately NOT committed: it is machine-specific glue (hardcoded cargo/JAVA_HOME
+# paths) and the CI workflow builds the same artifacts from `server/` directly.
+scripts/*
+
+# Cloudflare infrastructure / internal deploy files
+cloudflare-worker*.js
+wrangler*.toml
+.wrangler/
+static-build.Dockerfile
+
+# Build extracts, bootstrap sources, and temporary sub-repos
+libtalloc_extract/
+php_extract/
+termux-packages/
+proot/
+
+# Temporary / debug scripts and root files
+0x00
+debug.php
+patch-urls.php
+test_*.php
+test_*.txt
+termux-*.txt
+termux-*.gz
+InRelease.txt
+Packages.gz
+frankenphp-*
+pencarimovie*
+!pencarimovie-linux.sh
+!pencarimovie-termux.sh
+!pencarimovie-windows.bat
+!pencarimovie-docker.sh
+proot*
+libtalloc*
+libtirpc*
+php_*
+
+# Logs and generated runtime data.
+*.log
+MadelineProto.log
+log/
+downloads/
+
+# Release and build artifacts.
+dist/
+# The Rust crate's generated output, e2e scratch and local state.
+#
+# `storage/` is RUNTIME STATE and is never tracked (see the block below): it
+# holds the bot session, the WordPress API secret, the server auth token, the
+# per-user catalog settings and every cache. Only `storage/.gitkeep` is tracked
+# so a fresh clone still has the folder the binary expects. The release
+# packaging creates its own EMPTY `stage/<name>/storage/` (`release.yml`), so no
+# file here is needed by any consumer.
+target/
+dist/
+dist-native/
+dist-rust/
+_*/
+_*.txt
+_*.log
+e2e.*.log
+.server-port-scratch/
+# Tooling and integration-test harnesses in the crate: local-only, they talk to
+# a running server and to live Telegram bots. `cargo test --bin
+# pencarimovie-server` (the suite CI and the release gate run) does not compile
+# them.
+tools/
+tests/
+# Rolling "remaining work" scratchpad; nothing references it and its measured
+# numbers go stale with every release.
+NEXT.md
+# Rust APK (android/pencarimovie-rust): the engine is four copies of the Rust
+# ELF (~130 MB) staged into jniLibs by scripts/build-rust-apk.bat, plus Gradle
+# output. The sources, gradle files and keystores ARE tracked - only the
+# binaries and build dirs are not.
+android/pencarimovie-rust/app/src/main/jniLibs/
+android/pencarimovie-rust/app/build/
+android/pencarimovie-rust/build/
+android/pencarimovie-rust/.gradle/
+android/pencarimovie-rust/.kotlin/
+android/pencarimovie-rust/local.properties
+android/pencarimovie-rust/_ui*.png
+TG-FASTDOWNLOADER/
+*.zip
+*.tar.gz
+*.tgz
+*.tar
+*.deb
+*.apk
+*.lnk
+
+# Local FrankenPHP / PHP static build workspaces and caches.
+.spc.cache.php
+buildroot/
+source/
+pkgroot/
+php-sdk-binary-tools/
+spc
+spc.exe
+
+# OS/editor noise and local properties.
+.DS_Store
+Thumbs.db
+Microsoft/
+.idea/
+.vscode/
+.roo/
+local.properties
+storage/benchmark.js
+storage/test-ip-pin.sh
+*.jks
+release-keystore-password.txt
+
+# ---------------------------------------------------------------------------
+# Android projects tracked for CI (must stay at the end of this file).
+#
+# These negations have to come after every broad rule above, because git does
+# not descend into an excluded directory and evaluates patterns in order.
+# ---------------------------------------------------------------------------
+
+# Re-include the two projects the APK workflow builds.
+!android/termux-app-fork/
+!android/termux-app-fork-x86_64/
+
+# Sources live under com/pencarimovie/, which `pencarimovie*` would exclude.
+!android/termux-app-fork/app/main/java/com/pencarimovie/
+!android/termux-app-fork/app/main/java/com/pencarimovie/**
+!android/termux-app-fork-x86_64/app/main/java/com/pencarimovie/
+!android/termux-app-fork-x86_64/app/main/java/com/pencarimovie/**
+
+# Bootstrap ZIPs are build inputs, not release artifacts.
+!android/termux-app-fork/app/main/assets/
+!android/termux-app-fork/app/main/assets/*.zip
+!android/termux-app-fork-x86_64/app/main/assets/
+!android/termux-app-fork-x86_64/app/main/assets/*.zip
+
+# Signing keystores — development keys, already public in this project's
+# history. CI needs them to sign the release APK.
+!android/termux-app-fork/app/*.jks
+!android/termux-app-fork-x86_64/app/*.jks
+
+# Keep build output and IDE state out even inside the tracked projects.
+android/termux-app-fork/build/
+android/termux-app-fork/app/build/
+android/termux-app-fork/.gradle/
+android/termux-app-fork/.gradle_cache/
+android/termux-app-fork/.gradle_home/
+android/termux-app-fork/.gradle_user_home/
+android/termux-app-fork/.kotlin/
+android/termux-app-fork/.idea/
+android/termux-app-fork/local.properties
+android/termux-app-fork-x86_64/build/
+android/termux-app-fork-x86_64/app/build/
+android/termux-app-fork-x86_64/.gradle/
+android/termux-app-fork-x86_64/.gradle_cache/
+android/termux-app-fork-x86_64/.gradle_home/
+android/termux-app-fork-x86_64/.gradle_user_home/
+android/termux-app-fork-x86_64/.kotlin/
+android/termux-app-fork-x86_64/.idea/
+android/termux-app-fork-x86_64/local.properties
+
+# ---------------------------------------------------------------------------
+# android/pencarimovie-server — native Kotlin + TDLib server app.
+#
+# LOCAL-ONLY working copy. The APK is built and signed on this machine and the
+# SOURCE IS DELIBERATELY NOT IN THE REPOSITORY — only the published release
+# assets are, on the rolling `apk-server-latest` tag. The `android/*` rule above
+# therefore excludes this whole tree; do NOT add a `!android/pencarimovie-server/`
+# re-include (it was intentionally removed — the repo carries releases + the PHP
+# server only).
+#
+# Cutting a release from this machine:
+#   1. cd android/pencarimovie-server && gradlew :app:assembleDebug
+#   2. cd .. && powershell -File _stage_release.ps1      (stages + hashes + version.json)
+#   3. gh release upload apk-server-latest \
+#        _apk_dist/*.apk _apk_dist/*.sha256 _apk_dist/version.json --clobber
+# Keep version.json BOM-free: PowerShell's `Set-Content -Encoding UTF8` writes a
+# BOM and UpdateChecker's JSONObject() would throw, silently disabling updates.
+# ---------------------------------------------------------------------------
+
+# Runtime state + local build output. NEVER commit anything from storage/:
+# it accumulates the Telegram session, the WordPress API secret, the auth
+# token and the user's own catalog settings.
+storage/*
+!storage/.gitkeep
+# Android signing material. `release-key.jks` is the identity every installed
+# APK trusts, so it must never be published — neither the keystore nor its
+# password (read those from local.properties / the environment instead).
+*.jks
+*.keystore
+dist/
+dist-native/
+_*.txt
+_*.log
+_pmdeploy.tgz
+_heroku*.txt
+_apk*.txt
+
+# ---------------------------------------------------------------------------
+# legacy/ - superseded implementations.
+#
+# `legacy/php/` IS tracked: it is the behavioural reference the Rust port is
+# verified against (PARITY.md and PORT_GAPS.md at the repo root), so it stays in
+# the history. `legacy/ts/` is a dead TypeScript attempt that never reached parity and
+# carries a node_modules tree; it is kept on disk for reference only, never
+# committed. Same for the port's scratch archives.
+# ---------------------------------------------------------------------------
+legacy/ts/
+# The ledger generator for the archived tree's port audit; the generated
+# COVERAGE.md / ledger.json are what we keep.
+legacy/php/tools/
+
+# ---------------------------------------------------------------------------
+# android/ - LOCAL BUILD TREE, deliberately untracked.
+#
+# Every APK project lives here and none of it belongs in the public repo:
+#
+#   * it carries the RELEASE SIGNING KEY. `android/**/app/release-key.jks` is
+#     the identity every installed APK trusts, so publishing it lets anyone
+#     sign an APK that Android accepts as an upgrade over ours — a full
+#     supply-chain takeover. The keystore and its password stay on the build
+#     machine (`local.properties`, gitignored) — see ANDROID-SIGNING.md.
+#   * the compiled engine is a multi-hundred-MB `jniLibs/*.so` blob.
+#   * the shipped artifact is the APK, published as a GitHub release asset
+#     (`apk-server-latest`), not the source.
+#
+# Same reasoning already applied to `android/pencarimovie-server` and
+# `android/pencarimovie-rust` before this rule existed.
+# ---------------------------------------------------------------------------
+android/
+
+# ---------------------------------------------------------------------------
+# docs/ - internal design notes, kept out of the published tree.
+#
+# `docs/` holds working material: the port ledger, stress-run results, the
+# Telegram concurrency evaluation and the addon spec. Useful while working on
+# the engine, a distraction (and a maintenance liability) in the published
+# repository. The QUANTITATIVE record that belongs next to the code —
+# PARITY.md, PORT_GAPS.md, COVERAGE.md, CROSS-PLATFORM.md — is tracked at the
+# repo root, and README.md is the user-facing document.
+# ---------------------------------------------------------------------------
+docs/
+
+# The engine's internal engineering bookkeeping. Kept on disk as the working
+# record of port parity and platform support; none of it is product
+# documentation, and every file here goes stale the moment the code moves.
+PARITY.md
+PORT_GAPS.md
+COVERAGE.md
+CROSS-PLATFORM.md

@@ -1,0 +1,26 @@
+services:
+  pencarimovie:
+    image: ghcr.io/aiskendi/pencarimovie-server:latest
+    container_name: pencarimovie-server
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8088}:8088"
+    environment:
+      - PORT=${PORT:-8088}
+      - MALLOC_ARENA_MAX=2
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    volumes:
+      # The image sets PM_APP_ROOT=/data (see Dockerfile / Dockerfile.release), so
+      # /data is where sessions, auth.json, the api secret, the cache and the
+      # reports live. This used to mount /app/storage, which no image uses — the
+      # volume was silently discarded and every `docker compose up` started from
+      # an empty install (bot token re-entry + fresh guest provisioning each time).
+      #
+      # There is deliberately NO `build:` here: this file consumes the PUBLISHED
+      # multi-arch image. To build locally use
+      # `docker compose -f port/rust/docker-compose.yml up`, which compiles from
+      # source with the developer Dockerfile.
+      - ./storage:/data

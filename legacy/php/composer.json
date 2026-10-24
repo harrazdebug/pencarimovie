@@ -1,0 +1,37 @@
+{
+  "name": "pencarimovie/downloader",
+  "description": "Local browser-based Telegram downloader with MadelineProto streaming.",
+  "type": "project",
+  "require": {
+    "php": ">=8.2",
+    "cweagans/composer-patches": "^1.7",
+    "danog/madelineproto": "^8.9"
+  },
+  "extra": {
+    "composer-exit-on-patch-failure": true,
+    "patches": {
+      "danog/madelineproto": {
+        "Fix Windows IPC stream_socket_server notice": "patches/madelineproto-windows-ipc.patch"
+      },
+      "danog/async-orm": {
+        "Cap MemoryArray in-memory driver size": "patches/async-orm-memory-limit.patch"
+      },
+      "danog/ipc": {
+        "Prefer TCP loopback IPC server": "patches/ipc-tcp-default.patch"
+      }
+    }
+  },
+  "autoload": {
+    "psr-4": {
+      "TGFastDownloader\\": "src/"
+    }
+  },
+  "config": {
+    "sort-packages": true,
+    "allow-plugins": {
+      "cweagans/composer-patches": true
+    }
+  },
+  "minimum-stability": "stable",
+  "prefer-stable": true
+}

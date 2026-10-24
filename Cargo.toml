@@ -1,0 +1,66 @@
+[package]
+# Product name, not an engine name: this crate ships as `pencarimovie-server`
+# (Windows/Linux/macOS/Android), the same name as the Android app and the
+# published downloads. Do not reintroduce an engine suffix ("rust"/"port").
+name = "pencarimovie-server"
+version = "0.1.0"
+edition = "2024"
+
+# Faithful port of backend.php onto grammers (Telegram) + axum.
+# Versions are pinned to the families verified on the build host
+# (rustc 1.99.1), see README.md for the measured build numbers.
+[dependencies]
+aes = "0.8"
+anyhow = "1"
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
+bcrypt = "0.17"
+bytes = "1"
+cbc = "0.1"
+# Matcher group: the PHP/Kotlin patterns use look-arounds (`(?<!…)`, `(?=…)`),
+# which the `regex` crate deliberately does not support. fancy-regex falls back
+# to `regex` for every pattern without one, so the cost is confined to the few
+# filename patterns that need it.
+fancy-regex = "0.14"
+futures-util = "0.3"
+grammers-client = "0.11.0"
+grammers-session = { version = "0.11.0", default-features = false, features = ["serde"] }
+grammers-tl-types = "0.11.0"
+hex = "0.4"
+# The dashboard is EMBEDDED into the binary (`include_dir!`), so the whole server
+# is one `pencarimovie-server.exe` — no `public/` folder beside it, no PHP.
+include_dir = "0.7"
+# Android's cloudflared comes from the Termux repository, whose package payload is
+# `data.tar.xz`. Pure Rust so no C toolchain (and no `xz` binary on the device) is
+# needed; see the Android note on `ensure_cloudflared()` in tunnel.rs.
+lzma-rs = "0.3"
+md-5 = "0.10"
+rand = "0.9"
+# The persistent cache layer: one file instead of ~20k small JSON files. A cache
+# GET is 6.2 us vs 182-224 us for `stat`+`read`+`serde` on a JSON file, and a
+# write is 154 us with `Durability::None` vs 763 us for `fs::write`.
+# Verified to build for all four Android ABIs, including 32-bit armv7.
+redb = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "http2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+# ALAC playback: decode-only. Eclipse/Android cannot decode ALAC in `.m4a`, and
+# the PHP port transcoded it to FLAC with ffmpeg; here the PCM is decoded inside
+# the download request and wrapped in a WAV header, so no encoder is needed.
+symphonia = { version = "0.5", features = ["alac", "isomp4", "pcm", "wav"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "fs"] }
+tokio-stream = "0.1"
+url = "2"
+# fd_fold_latin_accents() is Unicode NFD + strip-combining-marks. `iconv` is not
+# available/portable here and the PHP's iconv attempt is documented as broken
+# (`Siccîn` -> `Sicc^in`), so the decomposition is done properly.
+unicode-normalization = "0.1"
+
+# Integration tests cannot import a bin crate's modules, so the two cache
+# benchmarks use `redb` directly; it is also a normal dependency now.
+[dev-dependencies]
+redb = "2"
+
+[profile.release]
+opt-level = 3

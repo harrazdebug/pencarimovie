@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+print_banner() {
+  [ -n "${PENCARIMOVIE_NO_BANNER:-}" ] && return 0
+  local orange="" reset=""
+  if [ -t 1 ]; then
+    orange="$(printf '\033[38;5;208m')"
+    reset="$(printf '\033[0m')"
+  fi
+  printf '%s' "$orange"
+  cat <<'EOF'
+
+ ========================================
+          PencariMovie Server
+ ========================================
+
+EOF
+  printf '%s' "$reset"
+}
+
+print_banner
+
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT_DIR"
+FRANKENPHP_BIN="$ROOT_DIR/bin/frankenphp"
+HOST="0.0.0.0"
+PORT="8088"
+
+# Detect LAN IP via default route (avoids virtual adapter IPs like Docker/VPN)
+LAN_IP=""
+
+# WSL: use powershell.exe to get Windows host's real LAN IP via route print
+if grep -qi microsoft /proc/version 2>/dev/null && command -v powershell.exe >/dev/null 2>&1; then
+  LAN_IP=$(powershell.exe -Command "route print -4 0.0.0.0 | Select-String '0.0.0.0\s+0.0.0.0' | ForEach-Object { (\$_ -split '\s+')[4] }" 2>/dev/null | tr -d '\r' | head -1)
+fi
+
+# macOS: use ipconfig getifaddr en0 or en1
+if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+  LAN_IP=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)
+fi
+
+# Standard Linux / Libwrt: use ip route get (avoids listing all adapters)
+if [ -z "$LAN_IP" ] && command -v ip >/dev/null 2>&1; then
+  LAN_IP=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
+fi
+
+# Fallback: hostname -I
+if [ -z "$LAN_IP" ] && command -v hostname >/dev/null 2>&1; then
+  LAN_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+fi
+
+# Fallback: ifconfig (BusyBox / Libwrt / OpenWrt)
+if [ -z "$LAN_IP" ] && command -v ifconfig >/dev/null 2>&1; then
+  LAN_IP=$(ifconfig 2>/dev/null | awk '
+    /inet / {
+      for (i=1; i<=NF; i++) {
+        if ($i ~ /^addr:/) { sub(/^addr:/, "", $i); ip=$i }
+        else if ($i == "inet" && $(i+1) !~ /^127\./) { ip=$(i+1) }
+      }
+      if (ip != "" && ip !~ /^127\./) { print ip; exit }
+    }
+  ')
+fi
+
+print_urls() {
+  echo ""
+  echo "  Local:    http://127.0.0.1:$PORT"
+  if [ -n "$LAN_IP" ]; then
+    echo "  Network:  http://$LAN_IP:$PORT"
+  fi
+  echo "  CLI:      pms [start|stop|restart|tunnel|autostart|uninstall]"
+  echo "  Stop:     pms stop"
+  echo "  Restart:  pms restart"
+  echo "  Tunnel:   pms tunnel"
+  echo "  Autostart: pms autostart [on|off]"
+  echo "  Uninstall: pms uninstall"
+  echo ""
+}
+
+# If the server is already listening on the port, do not start a second instance.
+if command -v curl >/dev/null 2>&1 && curl -s -m 2 "http://127.0.0.1:$PORT/" >/dev/null 2>&1; then
+  echo "Server is already running on port $PORT."
+  echo "  Local:    http://127.0.0.1:$PORT"
+  if [ -n "$LAN_IP" ]; then
+    echo "  Network:  http://$LAN_IP:$PORT"
+  fi
+  echo "  CLI:      pms [start|stop|restart|tunnel|autostart|uninstall]"
+  echo "  Stop:     pms stop"
+  echo "  Restart:  pms restart"
+  echo "  Tunnel:   pms tunnel"
+  echo "  Autostart: pms autostart [on|off]"
+  echo "  Uninstall: pms uninstall"
+  exit 0
+fi
+
+# Ensure the IPC worker wrapper and runtime are executable. Windows-created
+# tarballs often lose the +x bit, which makes ProcessRunner fail with
+# "Permission denied" when it spawns bin/php.
+chmod u+x "$FRANKENPHP_BIN" "$ROOT_DIR/bin/php" 2>/dev/null || true
+if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+  xattr -rd com.apple.quarantine "$ROOT_DIR/bin" 2>/dev/null || true
+fi
+
+if [ -x "$FRANKENPHP_BIN" ]; then
+  echo "Starting PencariMovie Server with FrankenPHP..."
+  export PATH="$ROOT_DIR/bin:$PATH"
+  export PHP_BINDIR="$ROOT_DIR/bin"
+  export PHPRC="$ROOT_DIR/bin"
+  export MALLOC_ARENA_MAX=2
+  export GODEBUG="${GODEBUG:-madvdontneed=1}"
+  export GOGC="${GOGC:-80}"
+
+  # Auto-tune memory on low-RAM Linux systems (e.g. 1GB-2GB VPS / Raspberry Pi)
+  if [ -z "${GOMEMLIMIT:-}" ] && [ -r /proc/meminfo ]; then
+    TOTAL_MEM_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    TOTAL_MEM_MB=$((TOTAL_MEM_KB / 1024))
+    if [ "$TOTAL_MEM_MB" -gt 0 ] && [ "$TOTAL_MEM_MB" -le 1024 ]; then
+      export GOMEMLIMIT="550MiB"
+      export FRANKENPHP_NUM_THREADS="${FRANKENPHP_NUM_THREADS:-4}"
+      export FRANKENPHP_MAX_THREADS="${FRANKENPHP_MAX_THREADS:-8}"
+      export PHP_MEMORY_LIMIT="${PHP_MEMORY_LIMIT:-128M}"
+      export FD_DOWNLOAD_PARALLEL_CHUNKS="${FD_DOWNLOAD_PARALLEL_CHUNKS:-2}"
+    elif [ "$TOTAL_MEM_MB" -gt 0 ] && [ "$TOTAL_MEM_MB" -le 2048 ]; then
+      export GOMEMLIMIT="1200MiB"
+      export FRANKENPHP_NUM_THREADS="${FRANKENPHP_NUM_THREADS:-6}"
+      export FRANKENPHP_MAX_THREADS="${FRANKENPHP_MAX_THREADS:-12}"
+      export FD_DOWNLOAD_PARALLEL_CHUNKS="${FD_DOWNLOAD_PARALLEL_CHUNKS:-3}"
+    fi
+  fi
+
+  if [ -f "$ROOT_DIR/Caddyfile" ]; then
+    nohup "$FRANKENPHP_BIN" run --config "$ROOT_DIR/Caddyfile" >/dev/null 2>&1 &
+  else
+    nohup "$FRANKENPHP_BIN" php-server --listen "$HOST:$PORT" --root "$ROOT_DIR" >/dev/null 2>&1 &
+  fi
+  echo $! > "$ROOT_DIR/.frankenphp.pid"
+  print_urls
+  echo "FrankenPHP server started (PID $(cat "$ROOT_DIR/.frankenphp.pid"))."
+  exit 0
+fi
+
+if ! command -v php >/dev/null 2>&1; then
+  echo "PHP or FrankenPHP is required but was not found."
+  echo "Place FrankenPHP at $FRANKENPHP_BIN or install PHP in PATH."
+  exit 1
+fi
+echo "Starting PencariMovie Server with PHP..."
+nohup php -S "$HOST:$PORT" "$ROOT_DIR/router.php" >/dev/null 2>&1 &
+echo $! > "$ROOT_DIR/.php-server.pid"
+print_urls
+echo "PHP server started (PID $(cat "$ROOT_DIR/.php-server.pid"))."

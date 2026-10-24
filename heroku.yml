@@ -1,0 +1,11 @@
+# Heroku container deploy — the native engine.
+#
+# One binary: the dashboard, the Stremio/Eclipse addon and the Telegram engine are
+# all compiled into `pencarimovie-server` (no PHP, no Composer, no vendor/). The
+# binary is its own entrypoint, reads PORT (dynos set it), binds 0.0.0.0 on a PaaS
+# marker and keeps state under PM_APP_ROOT (/data, set in the image).
+build:
+  docker:
+    web: Dockerfile
+run:
+  web: pencarimovie-server

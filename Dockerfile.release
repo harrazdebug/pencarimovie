@@ -1,0 +1,52 @@
+# syntax=docker/dockerfile:1
+#
+# Runtime image for the PUBLISHED multi-arch container. It packages a PREBUILT
+# binary — there is deliberately no toolchain, no cargo, no source here.
+#
+#   docker build -f Dockerfile.release --build-arg ARCH=amd64 -t pm:native-amd64 .
+#   docker build -f Dockerfile.release --build-arg ARCH=arm64 -t pm:native-arm64 .
+#
+# Why: the previous release path ran `Dockerfile` (FROM rust:1-alpine + cargo
+# build) inside a buildx multi-arch build. The arm64 half compiled ~450 crates
+# under QEMU emulation, which is the ~45 minutes that dominated every release.
+# The compile now happens natively in the `native-build` matrix (ubuntu-latest
+# and ubuntu-24.04-arm), and this file only COPYs the result.
+#
+# ARCH MUST BE `amd64` or `arm64` AND the binary must be the MUSL target
+# (x86_64-unknown-linux-musl / aarch64-unknown-linux-musl). A gnu binary copied
+# into alpine fails at exec with `not found`, because
+# /lib/ld-linux-{x86_64,aarch64}.so.1 does not exist here.
+#
+# ENV/EXPOSE/VOLUME/USER/HEALTHCHECK/CMD are kept byte-compatible with
+# `Dockerfile` so Heroku, Render (render.yaml -> ghcr.io/...:native) and
+# docker-compose observe exactly the same container contract.
+#
+# `Dockerfile` itself stays as-is: heroku.yml builds it from source server-side
+# and port/rust/docker-compose.yml uses it for local dev.
+
+FROM alpine:3.20
+
+ARG ARCH=amd64
+
+RUN apk add --no-cache ca-certificates tzdata curl \
+ && adduser -D -u 10001 -h /data pencarimovie \
+ && mkdir -p /data \
+ && chown -R 10001:10001 /data
+
+# The release workflow stages the musl binary here before building, so the build
+# context stays tiny (a few MB) instead of shipping the whole repo.
+COPY dist-docker/${ARCH}/pencarimovie-server /usr/local/bin/pencarimovie-server
+RUN chmod +x /usr/local/bin/pencarimovie-server
+
+ENV PM_APP_ROOT=/data \
+    PM_LISTEN_HOST=0.0.0.0 \
+    PORT=8088
+
+EXPOSE 8088
+VOLUME ["/data"]
+USER 10001
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
+  CMD curl -fsS "http://127.0.0.1:${PORT}/api/version" >/dev/null || exit 1
+
+CMD ["pencarimovie-server"]

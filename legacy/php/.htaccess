@@ -1,0 +1,28 @@
+# PencariMovie Server — Apache / cPanel (shared hosting) front controller.
+#
+# There is no FrankenPHP here: every route goes through index.php -> backend.php,
+# which serves public/ itself. Static files under public/ are served by Apache.
+# Delete this file when running under FrankenPHP / Caddy — it is only read by Apache.
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # Never expose app internals over HTTP: the MadelineProto session, the API
+    # secret (storage/api_secret.key), vendor/, and the runtime binaries.
+    RewriteRule ^(storage|vendor|bin|patches|scripts|src|state|plans|android|fastlane|fdroid)(/|$) - [F,L]
+    RewriteRule (^|/)\.(git|github)(/|$) - [F,L]
+
+    # public/ is the real asset root — let Apache serve it without PHP.
+    RewriteRule ^public/ - [L]
+
+    # Front controller for everything else (already index.php -> no-op).
+    RewriteRule ^index\.php$ - [L]
+    RewriteRule ^ index.php [L]
+</IfModule>
+
+# Belt and braces for hosts without mod_rewrite: the entry point is index.php only.
+# MadelineProto.log is created next to index.php (its default logger target), so it
+# must be blocked here — it is not inside the denied storage/ directory.
+<FilesMatch "^(backend\.php|router\.php|composer\.(json|lock)|package(-lock)?\.json|AGENTS\.md|CHANGELOG\.md|MadelineProto\.log)$">
+    Require all denied
+</FilesMatch>
